@@ -140,6 +140,65 @@ You can use this program to control the robot directly, but make sure the on-bor
 ./g1_ctrl --network eth0 # eth0 is the network interface name.
 ```
 
+### ExecuTorch (optional)
+
+The controller can also run a policy with [ExecuTorch](https://github.com/pytorch/executorch), PyTorch's solution for deploying models on devices. A policy keeps running its `policy.onnx` with ONNX Runtime unless its config names a `.pte` file.
+
+1. Build the controller with ExecuTorch. The build needs CMake 3.28 or newer and the C++ library inside the ExecuTorch Python package (ExecuTorch 1.6.0 needs Python 3.11 or newer). The library is all the build needs, so on the robot install the package without its dependencies:
+
+   ```bash
+   pip install --no-deps executorch==1.6.0
+   cmake .. -DUSE_EXECUTORCH=ON -DCMAKE_PREFIX_PATH="$(python -c 'import executorch, pathlib; print(pathlib.Path(executorch.__path__[0]) / "share" / "cmake")')"
+   make
+   ```
+
+   The controller loads the library from that Python environment every time it starts. Keep the environment, and rebuild the controller after changing the ExecuTorch version in it. ONNX Runtime stays linked, for the policies that still run `policy.onnx`.
+
+2. Export the policy to `exported/policy.pte`, next to its `policy.onnx`. The program takes the same inputs as `policy.onnx`, and stores their names in an `input_names` constant method, in the order `forward()` takes them. The `export_policy_to_executorch` exporter proposed for rsl_rl in [rsl_rl#271](https://github.com/leggedrobotics/rsl_rl/pull/271) writes such programs. It is not in a released rsl_rl yet, and it targets a newer rsl_rl than the one Isaac Lab 2.3 installs. To export directly, use a Python environment other than the Isaac Lab one, because `pip install executorch==1.6.0 onnx` brings torch 2.15.0. This example rebuilds the actor network from the weights in a `policy.onnx`, either one shipped in this repo or one that `play.py` wrote. Run it from the folder that holds `exported/`, for example `deploy/robots/g1_29dof/config/policy/velocity/v0`:
+
+   ```python
+   import onnx
+   import torch
+   from onnx import numpy_helper
+   from torch import nn
+   from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+   from executorch.exir import to_edge_transform_and_lower
+
+   model = onnx.load("exported/policy.onnx")
+   assert {n.op_type for n in model.graph.node} == {"Gemm", "Elu"}, "this example only rebuilds an ELU actor without an observation normalizer"
+   state = {t.name: torch.from_numpy(numpy_helper.to_array(t).copy()) for t in model.graph.initializer}
+   num_obs, num_actions = state["actor.0.weight"].shape[1], state["actor.6.weight"].shape[0]
+
+   # The actor from rsl_rl_ppo_cfg.py: actor_hidden_dims=[512, 256, 128], activation="elu", no observation normalization.
+   policy = nn.Sequential(
+       nn.Linear(num_obs, 512), nn.ELU(),
+       nn.Linear(512, 256), nn.ELU(),
+       nn.Linear(256, 128), nn.ELU(),
+       nn.Linear(128, num_actions),
+   )
+   policy.load_state_dict({k.removeprefix("actor."): v for k, v in state.items()})
+   policy.eval()
+
+   program = to_edge_transform_and_lower(
+       torch.export.export(policy, (torch.zeros(1, num_obs),)),
+       partitioner=[XnnpackPartitioner()],
+       constant_methods={"input_names": ["obs"]},
+   ).to_executorch()
+   with open("exported/policy.pte", "wb") as f:
+       f.write(program.buffer)
+   ```
+
+   Export the `.pte` again whenever the policy changes. The controller does not check that the `.pte` matches `policy.onnx`.
+
+3. Name the file in the policy's state in `config.yaml`, next to `policy_dir`:
+
+   ```yaml
+   policy_dir: config/policy/velocity
+   policy_file: exported/policy.pte
+   ```
+
+   `policy_file` is relative to the policy folder, which the controller prints at startup as `Policy directory`, and defaults to `exported/policy.onnx`. The controller runs each policy once at startup, so a `.pte` that does not match the observations in `deploy.yaml` stops it there, before the robot moves. A controller built without ExecuTorch stops at startup if a state names a `.pte`.
+
 ## Acknowledgements
 
 This repository is built upon the support and contributions of the following open-source projects. Special thanks to:

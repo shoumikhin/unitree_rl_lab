@@ -4,8 +4,13 @@
 #pragma once
 
 #include "onnxruntime_cxx_api.h"
+#include <filesystem>
 #include <iostream>
 #include <mutex>
+#ifdef USE_EXECUTORCH
+#include <executorch/extension/module/module.h>
+#include <executorch/extension/tensor/tensor.h>
+#endif
 
 namespace isaaclab
 {
@@ -105,4 +110,110 @@ private:
     std::vector<int64_t> input_sizes;
     std::vector<int64_t> output_shape;
 };
+
+#ifdef USE_EXECUTORCH
+class ExecuTorchRunner : public Algorithms
+{
+public:
+    ExecuTorchRunner(std::string model_path)
+    : module(model_path)
+    {
+        // Load and check the program's structure now: most malformed files then fail here with an error
+        // instead of crashing, and the first step of the control loop does not pay for loading.
+        if (module.load(executorch::runtime::Program::Verification::InternalConsistency) != executorch::runtime::Error::Ok
+            || module.load_forward() != executorch::runtime::Error::Ok) {
+            throw std::runtime_error("Failed to load " + model_path);
+        }
+
+        // Unlike ONNX, a program has no input names, so it stores them in an input_names method, in the order forward() takes them.
+        auto names = module.execute("input_names");
+        if (!names.ok()) {
+            throw std::runtime_error("Failed to read input_names from " + model_path);
+        }
+        auto method_meta = module.method_meta("forward");
+        if (names->size() != method_meta->num_inputs()) {
+            throw std::runtime_error("input_names in " + model_path + " must have one name per input");
+        }
+        for (const auto& name : *names) {
+            if (!name.isString()) {
+                throw std::runtime_error("input_names in " + model_path + " must be strings");
+            }
+            if (std::find(input_names.begin(), input_names.end(), name.toString()) != input_names.end()) {
+                throw std::runtime_error("input_names in " + model_path + " must be unique");
+            }
+            input_names.emplace_back(name.toString());
+        }
+
+        for (size_t i = 0; i < method_meta->num_inputs(); ++i) {
+            auto input = method_meta->input_tensor_meta(i);
+            if (!input.ok() || input->scalar_type() != executorch::aten::ScalarType::Float || input->sizes().empty()
+                || input->sizes()[0] != 1) {
+                throw std::runtime_error("Input " + input_names[i] + " of " + model_path + " must be a float tensor with a batch of 1");
+            }
+            input_shapes.emplace_back(input->sizes().begin(), input->sizes().end());
+            size_t size = 1;
+            for (auto dim : input->sizes()) {
+                size *= dim;
+            }
+            input_sizes.push_back(size);
+        }
+
+        auto output = method_meta->output_tensor_meta(0);
+        if (!output.ok() || output->sizes().size() != 2 || output->sizes()[0] != 1
+            || output->scalar_type() != executorch::aten::ScalarType::Float || !output->is_memory_planned()) {
+            throw std::runtime_error("The first output of " + model_path + " must be a float tensor of shape [1, N] with planned memory");
+        }
+        action.resize(output->sizes()[1]);
+    }
+
+    std::vector<float> act(std::unordered_map<std::string, std::vector<float>> obs)
+    {
+        // inputs only refer to these tensors, so they must stay alive until forward() returns.
+        std::vector<executorch::extension::TensorPtr> input_tensors;
+        std::vector<executorch::runtime::EValue> inputs;
+        for (size_t i = 0; i < input_names.size(); ++i) {
+            auto it = obs.find(input_names[i]);
+            if (it == obs.end()) {
+                throw std::runtime_error("Input name " + input_names[i] + " not found in observations.");
+            }
+            if (it->second.size() != input_sizes[i]) {
+                throw std::runtime_error("Input " + input_names[i] + " has " + std::to_string(it->second.size())
+                                         + " values, the policy expects " + std::to_string(input_sizes[i]));
+            }
+            input_tensors.push_back(executorch::extension::from_blob(it->second.data(), input_shapes[i]));
+            inputs.emplace_back(*input_tensors.back());
+        }
+
+        auto outputs = module.forward(inputs);
+        if (!outputs.ok()) {
+            throw std::runtime_error("Failed to run the policy.");
+        }
+        const auto& output = outputs->at(0).toTensor();
+        if (static_cast<size_t>(output.numel()) != action.size()) {
+            throw std::runtime_error("The policy returned " + std::to_string(output.numel()) + " actions, expected " + std::to_string(action.size()));
+        }
+        std::lock_guard<std::mutex> lock(act_mtx_);
+        std::memcpy(action.data(), output.const_data_ptr<float>(), action.size() * sizeof(float));
+        return action;
+    }
+
+private:
+    executorch::extension::Module module;
+    std::vector<std::string> input_names;
+    std::vector<std::vector<executorch::aten::SizesType>> input_shapes;
+    std::vector<size_t> input_sizes;
+};
+#endif
+
+inline std::unique_ptr<Algorithms> make_runner(const std::filesystem::path& policy_file)
+{
+    if (policy_file.extension() == ".pte") {
+#ifdef USE_EXECUTORCH
+        return std::make_unique<ExecuTorchRunner>(policy_file);
+#else
+        throw std::runtime_error(policy_file.string() + " needs a controller built with -DUSE_EXECUTORCH=ON");
+#endif
+    }
+    return std::make_unique<OrtRunner>(policy_file);
+}
 };
